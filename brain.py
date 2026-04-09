@@ -1,4 +1,3 @@
-
 from actions import (
     saudacao, hora_atual, data_atual, despedida,
     perguntar_ia, carregar_memoria, salvar_memoria
@@ -9,7 +8,7 @@ memoria = carregar_memoria()
 def processar(comando):
     comando = comando.lower()
 
-    # 👇 MEMÓRIA (NOVO)
+    # MEMÓRIA
     if "meu nome é" in comando:
         nome = comando.replace("meu nome é", "").strip()
         memoria["nome"] = nome
@@ -22,7 +21,7 @@ def processar(comando):
         else:
             return "Você ainda não me disse seu nome."
 
-    # 👇 COMANDOS EXISTENTES
+    # COMANDOS EXISTENTES
     if any(p in comando for p in ["oi", "olá", "ola", "e aí", "eai", "bom dia", "boa tarde", "boa noite"]):
         return saudacao()
 
@@ -35,4 +34,5 @@ def processar(comando):
     if any(p in comando for p in ["tchau", "até mais", "ate mais", "encerrar", "bye"]):
         return despedida()
 
-    return perguntar_ia(comando)
+    # IA
+    return perguntar_ia(comando, memoria)
