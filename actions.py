@@ -41,3 +41,17 @@ def perguntar_ia(pergunta):
     conteudo = resposta.choices[0].message.content
     historico.append({"role": "assistant", "content": conteudo})
     return conteudo
+
+import json
+
+def carregar_memoria():
+    try:
+        with open("data/memory.json", "r") as f:
+            return json.load(f)
+    except:
+        return {}
+
+def salvar_memoria(memoria):
+    with open("data/memory.json", "w") as f:
+        json.dump(memoria, f, indent=4)
+
