@@ -7,11 +7,11 @@ import threading
 from groq import Groq
 
 from src.aris.actions.models import AIRequest, ActionResponse
+from src.aris.memory.policy import normalize_memory_shape, should_extract_facts_with_ai
+from src.aris.memory.session import append_history, get_history_window
 from src.aris.memory.store import (
-    append_history,
     aprender_padrao,
     buscar_padrao,
-    get_history_window,
     merge_facts,
     salvar_memoria,
     update_local_memory,
@@ -23,7 +23,6 @@ from src.aris.memory.vector_store import (
 )
 from src.aris.persona import (
     build_ai_system_messages,
-    build_core_identity_prompt,
     build_interpretation_prompt,
     build_memory_extraction_prompt,
     build_third_party_user_prompt,
@@ -43,15 +42,6 @@ def _get_client():
     if _client is None:
         _client = Groq(api_key=api_key)
     return _client
-
-CONTEXT_ARIS = build_core_identity_prompt()
-
-
-def _deve_usar_ia_memoria(texto: str) -> bool:
-    gatilhos = ("meu nome", "me chamo", "minha idade", "tenho ", "nasci")
-    texto = texto.lower()
-    return any(gatilho in texto for gatilho in gatilhos)
-
 
 def atualizar_memoria_com_ia(texto: str, memoria: dict) -> dict:
     prompt = build_memory_extraction_prompt(texto)
@@ -78,7 +68,7 @@ def atualizar_memoria_com_ia(texto: str, memoria: dict) -> dict:
 def _atualizar_memoria_assincrona(texto: str, memoria: dict) -> None:
     update_local_memory(texto, memoria)
 
-    if not _deve_usar_ia_memoria(texto):
+    if not should_extract_facts_with_ai(texto):
         return
 
     def _run():
@@ -111,7 +101,7 @@ def interpretar(texto: str) -> dict:
 
 def perguntar_com_ia(request: AIRequest) -> ActionResponse:
     pergunta_original = request.original_text or request.question
-    memoria = request.memory
+    memoria = normalize_memory_shape(request.memory)
 
     memorias_relevantes: list[str]
     if pergunta_original and is_third_party_request(pergunta_original):
@@ -149,7 +139,7 @@ def perguntar_com_ia(request: AIRequest) -> ActionResponse:
 
         threading.Thread(
             target=salvar_memoria_vetorial,
-            args=(f"Usuario: {pergunta_original} | ARIS: {resposta}",),
+            args=(pergunta_original, resposta),
             daemon=True,
         ).start()
 

@@ -8,8 +8,10 @@ import numpy as np
 from sentence_transformers import SentenceTransformer
 
 from src.aris.config.settings import settings
+from src.aris.memory.policy import sanitize_recalled_memories, should_retrieve_vector_memory, should_store_vector_memory
 
 _embedding_model = None
+_vector_lock = threading.RLock()
 
 
 def _get_embedding_model():
@@ -40,29 +42,40 @@ def gerar_embedding(texto: str):
         return None
 
 
-def salvar_memoria_vetorial(texto: str) -> None:
+def salvar_memoria_vetorial(texto: str, resposta: str | None = None) -> None:
+    pergunta = " ".join(str(texto or "").split()).strip()
+    resposta_limpa = " ".join(str(resposta or "").split()).strip()
+
+    if resposta is not None and not should_store_vector_memory(pergunta, resposta_limpa):
+        return
+
     path = settings.vector_memory_path
     settings.data_dir.mkdir(parents=True, exist_ok=True)
 
-    if path.exists():
-        with open(path, "r", encoding="utf-8") as handle:
-            dados = json.load(handle)
-    else:
-        dados = []
-
-    embedding = gerar_embedding(texto)
-    if embedding:
-        dados.append(
-            {
-                "texto": texto,
+    with _vector_lock:
+        dados = _carregar_dados_vetoriais(path)
+        texto_memoria = pergunta if resposta is None else f"Usuario: {pergunta} | ARIS: {resposta_limpa}"
+        embedding = gerar_embedding(texto_memoria)
+        if embedding:
+            entrada = {
+                "texto": texto_memoria,
                 "embedding": embedding,
                 "timestamp": datetime.now().isoformat(),
             }
-        )
+            if resposta is not None:
+                entrada.update(
+                    {
+                        "pergunta": pergunta,
+                        "resposta": resposta_limpa,
+                        "authority": "low",
+                        "kind": "dialogue_pair",
+                    }
+                )
+            dados.append(entrada)
 
-    dados = dados[-300:]
-    with open(path, "w", encoding="utf-8") as handle:
-        json.dump(dados, handle, ensure_ascii=False)
+        dados = dados[-300:]
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(dados, handle, ensure_ascii=False)
 
 
 def _similaridade(a, b) -> float:
@@ -72,12 +85,15 @@ def _similaridade(a, b) -> float:
 
 
 def buscar_memoria_vetorial(pergunta: str) -> list[str]:
+    if not should_retrieve_vector_memory(pergunta):
+        return []
+
     path = settings.vector_memory_path
     if not path.exists():
         return []
 
-    with open(path, "r", encoding="utf-8") as handle:
-        dados = json.load(handle)
+    with _vector_lock:
+        dados = _carregar_dados_vetoriais(path)
 
     emb_pergunta = gerar_embedding(pergunta)
     if not emb_pergunta:
@@ -85,12 +101,28 @@ def buscar_memoria_vetorial(pergunta: str) -> list[str]:
 
     scores: list[tuple[float, str]] = []
     for item in dados:
+        if not isinstance(item, dict):
+            continue
+        texto = " ".join(str(item.get("texto", "")).split()).strip()
+        if not texto:
+            continue
         emb = item.get("embedding", [])
         if len(emb) != len(emb_pergunta):
             continue
         sim = _similaridade(emb_pergunta, emb)
-        if sim > 0.55:
-            scores.append((sim, item["texto"]))
+        if sim > 0.62:
+            scores.append((sim, texto))
 
     scores.sort(reverse=True)
-    return [texto for _, texto in scores[:7]]
+    return sanitize_recalled_memories([texto for _, texto in scores], limit=4)
+
+
+def _carregar_dados_vetoriais(path) -> list[dict]:
+    if not path.exists():
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            dados = json.load(handle)
+    except Exception:
+        return []
+    return dados if isinstance(dados, list) else []
