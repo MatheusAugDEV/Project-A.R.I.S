@@ -1,0 +1,208 @@
+"""
+Fachada de wake word do ARIS.
+Mantem compatibilidade com o codigo existente, delegando para modulos especializados.
+"""
+
+from __future__ import annotations
+
+import threading
+import time
+
+import numpy as np
+import sounddevice as sd
+
+from audio_frontend import (
+    PEAK_MULT,
+    SAMPLE_RATE,
+    calibrate_input_threshold,
+    emit_level,
+    normalize_audio as _normalizar_audio,
+    resolve_input_device as _resolver_input_device,
+    speech_ratio as _speech_ratio,
+)
+from speaker_verify import load_voice_profile as _carregar_perfil
+from wake_engine import (
+    OPENWAKEWORD_THRESHOLD,
+    STRONG_SIM_THRESHOLD,
+    WEAK_SIM_THRESHOLD,
+    analisar_buffer,
+    contem_wake as _contem_wake,
+    get_openwakeword_backend as _get_wake_backend,
+)
+
+WINDOW_SECS = 2.2
+STEP_SECS = 0.25
+COOLDOWN = 6.0
+CONFIRM_WINDOW = 1.6
+STRONG_SCORE = 4.6
+STARTUP_GRACE = 4.0
+
+_stop_evt = threading.Event()
+_tts_ativo = False
+_listener_thread = None
+_callback = None
+_level_callback = None
+
+
+def start(callback, level_callback=None):
+    """Inicia o listener persistente."""
+    global _listener_thread, _callback, _level_callback
+
+    _callback = callback
+    _level_callback = level_callback
+    if _listener_thread is not None and _listener_thread.is_alive():
+        print("[Wake] Listener ja esta ativo.")
+        return
+
+    _stop_evt.clear()
+    _carregar_perfil()
+    _get_wake_backend()
+    threshold = calibrate_input_threshold()
+
+    def _run():
+        try:
+            _loop(threshold)
+        except Exception as e:
+            print(f"[Wake] erro no loop: {e}")
+
+    _listener_thread = threading.Thread(target=_run, daemon=True)
+    _listener_thread.start()
+    print("[Wake] Aguardando 'ARIS' (global, persistente)...")
+
+
+def stop(join_timeout: float = 2.0):
+    global _listener_thread
+
+    _stop_evt.set()
+    emit_level(_level_callback, 0.0)
+    thread = _listener_thread
+    if thread is not None and thread.is_alive() and threading.current_thread() is not thread:
+        thread.join(timeout=join_timeout)
+    _listener_thread = None
+
+
+def _loop(threshold: float):
+    step = int(SAMPLE_RATE * STEP_SECS)
+    window = int(SAMPLE_RATE * WINDOW_SECS)
+    buf = np.zeros(window, dtype=np.float32)
+    cooldown_until = 0.0
+    pending_until = 0.0
+    pending_hits = 0
+    pending_best_score = 0.0
+    startup_until = time.monotonic() + STARTUP_GRACE
+
+    with sd.InputStream(
+        samplerate=SAMPLE_RATE,
+        channels=1,
+        dtype="float32",
+        blocksize=step,
+        device=_resolver_input_device(),
+    ) as stream:
+        while not _stop_evt.is_set():
+            chunk, _ = stream.read(step)
+            buf = np.roll(buf, -step)
+            buf[-step:] = chunk.flatten()
+
+            now = time.monotonic()
+            if now < startup_until or now < cooldown_until or _tts_ativo:
+                emit_level(_level_callback, 0.0)
+                continue
+            if now >= pending_until:
+                pending_until = 0.0
+                pending_hits = 0
+                pending_best_score = 0.0
+
+            rms = float(np.sqrt(np.mean(buf**2)))
+            peak = float(np.max(np.abs(buf)))
+            level = max(
+                rms / max(threshold * 3.0, 1e-6),
+                peak / max(threshold * PEAK_MULT * 1.1, 1e-6),
+            )
+            emit_level(_level_callback, level)
+            if rms < threshold * 0.85 and peak < threshold * PEAK_MULT * 0.85:
+                threshold = max(0.010, threshold * 0.985 + rms * 2.2 * 0.015)
+            if rms < threshold and peak < threshold * PEAK_MULT:
+                continue
+
+            # Evita mandar ruído curto ou respingos para a transcrição do wake.
+            chunk_speech = _speech_ratio(buf)
+            if chunk_speech < 0.12:
+                continue
+
+            try:
+                resultado = analisar_buffer(buf)
+            except Exception as e:
+                print(f"[Wake] erro ao analisar audio: {e}")
+                continue
+
+            texto = resultado["texto"]
+            sim = resultado["sim"]
+            score = resultado["score"]
+            speech_ratio = resultado["speech_ratio"]
+            ow_score = resultado["ow_score"]
+            should_log = resultado.get("should_log", False)
+            wake_forte = resultado.get("wake_forte", False)
+            wake_phrase_exact = resultado.get("wake_phrase_exact", False)
+            wake_prefix_match = resultado.get("wake_prefix_match", False)
+            repeticoes_wake = resultado.get("repeticoes_wake", 0)
+
+            if should_log:
+                if sim is None and ow_score is None:
+                    print(
+                        f"[Wake] ouviu: '{texto}' | score={score:.2f} "
+                        f"| speech={speech_ratio:.2f} "
+                        f"| rms={resultado['rms']:.4f} peak={resultado['peak']:.4f}"
+                    )
+                elif ow_score is None:
+                    print(
+                        f"[Wake] ouviu: '{texto}' | score={score:.2f} sim={sim:.2f} "
+                        f"| speech={speech_ratio:.2f} "
+                        f"| rms={resultado['rms']:.4f} peak={resultado['peak']:.4f}"
+                    )
+                elif sim is None:
+                    print(
+                        f"[Wake] ouviu: '{texto}' | score={score:.2f} oww={ow_score:.2f} "
+                        f"| speech={speech_ratio:.2f} "
+                        f"| rms={resultado['rms']:.4f} peak={resultado['peak']:.4f}"
+                    )
+                else:
+                    print(
+                        f"[Wake] ouviu: '{texto}' | score={score:.2f} sim={sim:.2f} oww={ow_score:.2f} "
+                        f"| speech={speech_ratio:.2f} "
+                        f"| rms={resultado['rms']:.4f} peak={resultado['peak']:.4f}"
+                    )
+
+            ativacao_imediata = (
+                (wake_phrase_exact or wake_prefix_match or repeticoes_wake >= 2)
+                and speech_ratio >= 0.20
+                and score >= 4.0
+            )
+
+            if resultado["ativar"]:
+                pending_hits += 1
+                pending_best_score = max(pending_best_score, score)
+                pending_until = now + CONFIRM_WINDOW
+
+                confirmou = (
+                    ativacao_imediata
+                    or pending_best_score >= STRONG_SCORE
+                    or wake_phrase_exact
+                    or wake_prefix_match
+                    or wake_forte
+                    or pending_hits >= 2
+                )
+                if confirmou:
+                    print("[Wake] ativado!")
+                    cooldown_until = now + COOLDOWN
+                    pending_until = 0.0
+                    pending_hits = 0
+                    pending_best_score = 0.0
+                    callback = _callback
+                    if callback is not None:
+                        threading.Thread(target=callback, daemon=True).start()
+            elif should_log and texto:
+                print(
+                    f"[Wake] rejeitado: '{texto}' | ativar={resultado['ativar']} "
+                    f"| forte={wake_forte} | exata={wake_phrase_exact} "
+                    f"| prefixo={wake_prefix_match} | repeticoes={repeticoes_wake}"
+                )
