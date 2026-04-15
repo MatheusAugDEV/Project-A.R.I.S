@@ -3,7 +3,8 @@ from __future__ import annotations
 from duckduckgo_search import DDGS
 
 from src.aris.actions.models import ActionResponse, SearchRequest
-from src.aris.actions.responders.ai import CONTEXT_ARIS, MODEL, _get_client, _instrucoes_de_resposta
+from src.aris.actions.responders.ai import MODEL, _get_client
+from src.aris.persona import build_search_system_messages
 
 
 def _buscar_web(query: str, n: int = 5):
@@ -51,24 +52,8 @@ def pesquisar_com_ia(request: SearchRequest) -> ActionResponse:
     if not resultados:
         return ActionResponse(text=f"Nao encontrei resultados para '{query}'.", source="search-empty")
 
-    mensagens = [
-        {"role": "system", "content": CONTEXT_ARIS},
-        {
-            "role": "system",
-            "content": (
-                f"Resultados da busca para '{query}':\n\n{contexto}\n\n"
-                f"{instrucao}\n\n"
-                "IMPORTANTE:\n"
-                "- Fale de forma natural, como se estivesse contando para alguem\n"
-                "- Nao leia como uma lista de resultados de busca\n"
-                "- Integre as informacoes de forma fluida\n"
-                "- Se houver links importantes, mencione naturalmente\n"
-                "- Se os resultados forem fracos, seja honesto sobre isso\n"
-            ),
-        },
-        {"role": "system", "content": _instrucoes_de_resposta(request.original_text or query)},
-        {"role": "user", "content": request.original_text or query},
-    ]
+    mensagens = build_search_system_messages(query, request.original_text, contexto, instrucao)
+    mensagens.append({"role": "user", "content": request.original_text or query})
 
     try:
         resp = _get_client().chat.completions.create(

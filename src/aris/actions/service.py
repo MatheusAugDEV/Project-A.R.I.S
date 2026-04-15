@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-from datetime import datetime
-
 from src.aris.actions.commands.registry import execute_command, resolve_command
 from src.aris.actions.models import AIRequest, ActionDecision, CommandResult
 from src.aris.actions.responders.ai import perguntar_com_ia
 from src.aris.actions.responders.search import pesquisar_com_ia
 from src.aris.actions.router import build_search_request, decide_action, interpretar
 from src.aris.memory.store import carregar_memoria
+from src.aris.persona import build_greeting_text
 
 
 def perguntar_ia(pergunta: str, memoria: dict) -> str:
@@ -60,14 +59,7 @@ def resolver_acao_operacional(texto: str, *, local_intent: str | None = None) ->
 
 
 def saudacao() -> str:
-    hora = datetime.now().hour
-    if 5 <= hora < 12:
-        return "Bom dia. Sistemas prontos."
-    if 12 <= hora < 18:
-        return "Boa tarde. Sistemas prontos."
-    if 18 <= hora < 23:
-        return "Boa noite. Sistemas prontos."
-    return "Boa madrugada. Sistemas prontos."
+    return build_greeting_text()
 
 
 __all__ = [

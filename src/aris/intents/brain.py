@@ -6,6 +6,8 @@ brain.py
 import re
 from datetime import datetime
 
+from src.aris.persona import build_greeting_text
+
 
 # ─── MAPA DE INTENÇÕES ─────────────────────────────────────
 
@@ -40,16 +42,7 @@ def executar_intencao(intencao: str, texto: str = "") -> str:
         return f"Hoje é {dias[now.weekday()]}, {now.strftime('%d/%m/%Y')}."
 
     if intencao == "saudacao":
-        hora = datetime.now().hour
-        if 5 <= hora < 12:
-            periodo = "Bom dia"
-        elif 12 <= hora < 18:
-            periodo = "Boa tarde"
-        elif 18 <= hora < 23:
-            periodo = "Boa noite"
-        else:
-            periodo = "Boa madrugada"
-        return f"{periodo}. Sistemas prontos. Como posso ajudar?"
+        return build_greeting_text()
 
     if intencao == "sistema":
         try:

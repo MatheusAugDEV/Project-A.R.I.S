@@ -31,16 +31,23 @@ def salvar_memoria(memoria: dict) -> None:
 
 
 def aprender_padrao(pergunta: str, resposta: str, memoria: dict) -> dict:
+    entrada = _normalizar_texto_de_padrao(pergunta)
+    if not entrada:
+        return memoria
     memoria.setdefault("padroes", [])
-    memoria["padroes"].append({"entrada": pergunta.lower(), "saida": resposta})
+    memoria["padroes"].append({"entrada": entrada, "saida": resposta})
     memoria["padroes"] = memoria["padroes"][-100:]
     return memoria
 
 
 def buscar_padrao(pergunta: str, memoria: dict) -> str | None:
+    alvo = _normalizar_texto_de_padrao(pergunta)
+    if not alvo:
+        return None
     for padrao in reversed(memoria.get("padroes", [])):
-        if padrao["entrada"] in pergunta.lower():
-            return padrao["saida"]
+        entrada = _normalizar_texto_de_padrao(padrao.get("entrada", ""))
+        if entrada == alvo:
+            return padrao.get("saida")
     return None
 
 
@@ -72,6 +79,13 @@ def _registrar_fato(memoria: dict, chave: str, valor: str) -> bool:
         return False
     memoria["fatos"][chave] = valor
     return True
+
+
+def _normalizar_texto_de_padrao(texto: str) -> str:
+    texto = (texto or "").strip().lower()
+    texto = re.sub(r"[?!.,;:]+", "", texto)
+    texto = re.sub(r"\s+", " ", texto)
+    return texto
 
 
 def _extrair_fatos_rapido(texto: str) -> dict[str, str]:

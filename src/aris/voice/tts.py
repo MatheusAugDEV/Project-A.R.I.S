@@ -11,18 +11,13 @@ import soundfile as sf
 from dotenv import load_dotenv
 
 from src.aris.config.settings import settings
+from src.aris.persona import build_tts_style_prompt
 
 MODEL_PATH = str(settings.piper_model_path)
 PIPER_BIN = settings.piper_bin
 ENV_PATH = settings.env_path
 _SPEAK_LOCK = threading.Lock()
-DEFAULT_STYLE = (
-    "Fale em portugues do Brasil com voz masculina, grave, controlada e sofisticada. "
-    "Use ritmo moderado, diccao muito clara, tom tecnologico elegante e confiante. "
-    "Soe como um assistente premium, calmo, preciso e levemente sintetico, sem exagero emocional. "
-    "Evite teatralidade, humor forcado, gritos ou entusiasmo excessivo. "
-    "Mantenha pausas curtas e autoridade serena."
-)
+DEFAULT_STYLE = build_tts_style_prompt()
 
 
 def _load_config() -> dict:
