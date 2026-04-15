@@ -326,6 +326,7 @@ def capture_interaction_audio(
     session_id: Optional[int] = None,
     level_callback=None,
     config: Optional[CaptureConfig] = None,
+    activation_label: str = "on_demand:unknown",
 ) -> CaptureResult:
     config = config or CaptureConfig()
     threshold = calibrate_input_threshold(
@@ -342,7 +343,8 @@ def capture_interaction_audio(
 
     print(
         f"[Audio] Sessao {session_id} capturando "
-        f"(threshold={threshold:.4f}, preroll={config.preroll_ms}ms, hold={config.silence_hold_ms}ms)"
+        f"(activation={activation_label}, threshold={threshold:.4f}, "
+        f"preroll={config.preroll_ms}ms, hold={config.silence_hold_ms}ms)"
     )
 
     preroll = deque(maxlen=preroll_chunks)
@@ -460,7 +462,8 @@ def capture_interaction_audio(
 
     print(
         f"[Audio] Sessao {session_id} encerrada "
-        f"(accepted={accepted}, reason={reason}, active_secs={active_secs:.2f}, ratio={ratio:.2f})"
+        f"(activation={activation_label}, accepted={accepted}, reason={reason}, "
+        f"active_secs={active_secs:.2f}, ratio={ratio:.2f})"
     )
 
     return CaptureResult(

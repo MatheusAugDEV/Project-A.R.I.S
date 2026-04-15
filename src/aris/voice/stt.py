@@ -75,20 +75,37 @@ def transcrever(audio: np.ndarray) -> str:
     return texto
 
 
-def ouvir_com_resultado(session_id=None, level_callback=None) -> tuple[str, CaptureResult]:
-    capture = capture_interaction_audio(session_id=session_id, level_callback=level_callback)
+def ouvir_com_resultado(
+    session_id=None,
+    level_callback=None,
+    activation_label: str = "on_demand:unknown",
+) -> tuple[str, CaptureResult]:
+    capture = capture_interaction_audio(
+        session_id=session_id,
+        level_callback=level_callback,
+        activation_label=activation_label,
+    )
     if not capture.accepted:
         print(
             f"[STT] Sessao {session_id} descartada no front-end "
-            f"(reason={capture.reason}, active_secs={capture.active_secs:.2f}, ratio={capture.speech_ratio:.2f})"
+            f"(activation={activation_label}, reason={capture.reason}, "
+            f"active_secs={capture.active_secs:.2f}, ratio={capture.speech_ratio:.2f})"
         )
         return "", capture
 
     return transcrever(capture.audio), capture
 
 
-def ouvir(level_callback=None, session_id=None) -> str:
-    texto, _ = ouvir_com_resultado(session_id=session_id, level_callback=level_callback)
+def ouvir(
+    level_callback=None,
+    session_id=None,
+    activation_label: str = "on_demand:unknown",
+) -> str:
+    texto, _ = ouvir_com_resultado(
+        session_id=session_id,
+        level_callback=level_callback,
+        activation_label=activation_label,
+    )
     return texto
 
 
@@ -111,9 +128,12 @@ def aquecer():
     threading.Thread(target=_run, daemon=True).start()
 
 
-def ouvir_async(callback, level_callback=None):
+def ouvir_async(callback, level_callback=None, activation_label: str = "on_demand:unknown"):
     def _run():
-        texto = ouvir(level_callback=level_callback)
+        texto = ouvir(
+            level_callback=level_callback,
+            activation_label=activation_label,
+        )
         if texto:
             callback(texto)
     threading.Thread(target=_run, daemon=True).start()

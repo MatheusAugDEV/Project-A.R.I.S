@@ -6,6 +6,12 @@ from typing import Optional
 
 from src.aris.app.state_machine import AppEvent, AppState, InvalidTransitionError, StateMachine
 from src.aris.app.ui_state import UIStateSnapshot
+from src.aris.voice.activation import (
+    VoiceActivationMode,
+    VoiceActivationRequest,
+    VoiceActivationSource,
+    evaluate_voice_activation_request,
+)
 
 print("[INIT] Importando ARISOrb...")
 from src.aris.ui.gui_orbe import ARISOrb
@@ -339,6 +345,49 @@ def _handle_runtime_failure(
         _schedule_runtime_recovery(stage, rewarm_stt=rewarm_stt)
 
 
+def _build_voice_request(source: VoiceActivationSource) -> VoiceActivationRequest:
+    return VoiceActivationRequest(mode=VoiceActivationMode.ON_DEMAND, source=source)
+
+
+def _solicitar_ativacao_por_voz(request: VoiceActivationRequest) -> bool:
+    decision = evaluate_voice_activation_request(
+        request,
+        app_state=_state_machine.state,
+        runtime_ready=_runtime_operational.is_set(),
+        has_active_interaction=_has_active_interaction(),
+        recovery_pending=_recovery_pending.is_set(),
+    )
+
+    if not decision.accepted:
+        print(
+            f"[ARIS] Ativacao por voz rejeitada "
+            f"({request.activation_label}, motivo={decision.rejection.value})."
+        )
+        return False
+
+    _iniciar_escuta_por_voz(request)
+    return True
+
+
+def sinalizar_ativacao_por_wakeword() -> bool:
+    request = VoiceActivationRequest(
+        mode=VoiceActivationMode.WAKEWORD,
+        source=VoiceActivationSource.WAKEWORD_ENGINE,
+    )
+    decision = evaluate_voice_activation_request(
+        request,
+        app_state=_state_machine.state,
+        runtime_ready=_runtime_operational.is_set(),
+        has_active_interaction=_has_active_interaction(),
+        recovery_pending=_recovery_pending.is_set(),
+    )
+    print(
+        f"[ARIS] Wake word nao iniciada "
+        f"({request.activation_label}, motivo={decision.rejection.value})."
+    )
+    return False
+
+
 def _falar_async(texto: str, ao_final=None, ao_erro=None):
     def _run():
         _fala_em_andamento.set()
@@ -527,19 +576,11 @@ def processar_e_responder(texto: str):
 
 
 def solicitar_escuta_por_voz():
-    if _state_machine.state != AppState.IDLE:
-        print(f"[ARIS] Pedido de voz ignorado no estado {_state_machine.state.value}.")
-        return
-
-    _iniciar_escuta_por_voz()
+    _solicitar_ativacao_por_voz(_build_voice_request(VoiceActivationSource.HOTKEY_F8))
 
 
-def _iniciar_escuta_por_voz():
-    if _has_active_interaction():
-        print("[ARIS] Pedido de voz ignorado: ja existe interacao ativa.")
-        return
-
-    interaction_id = _begin_interaction("voice", phase="listening")
+def _iniciar_escuta_por_voz(request: VoiceActivationRequest):
+    interaction_id = _begin_interaction(request.activation_label, phase="listening")
     if interaction_id is None:
         print("[ARIS] Nao foi possivel iniciar interacao por voz.")
         return
@@ -572,7 +613,11 @@ def _iniciar_escuta_por_voz():
     def _run():
         try:
             _ao_nivel_audio(0.0)
-            texto = ouvir(level_callback=_ao_nivel_audio, session_id=interaction_id)
+            texto = ouvir(
+                level_callback=_ao_nivel_audio,
+                session_id=interaction_id,
+                activation_label=request.activation_label,
+            )
             if not _is_active_interaction(interaction_id):
                 print(f"[ARIS] Resultado STT descartado para interacao antiga {interaction_id}.")
                 return
@@ -606,7 +651,7 @@ def _criar_orb():
     novo_orb = ARISOrb()
 
     def ouvir_e_processar():
-        solicitar_escuta_por_voz()
+        _solicitar_ativacao_por_voz(_build_voice_request(VoiceActivationSource.GUI_BUTTON))
 
     novo_orb.on_input = processar_e_responder
     novo_orb.on_voice = ouvir_e_processar
