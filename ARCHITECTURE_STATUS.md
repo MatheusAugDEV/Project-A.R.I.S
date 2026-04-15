@@ -47,9 +47,17 @@ The official ARIS runtime today is a local/manual flow:
 - process through local intents, safe commands, search, or AI
 - speak the response with TTS
 
+## Local Runtime Assets
+
+The current runtime expects local Piper assets under `models/piper/`, especially:
+
+- `models/piper/pt_BR-faber-medium.onnx`
+- `models/piper/pt_BR-faber-medium.onnx.json`
+
+These files are runtime assets, not source code. They should be treated as local/external artifacts and should not be committed by default.
+
 ## Explicit Non-Goals of the Current Runtime
 
 Persistent wake word and background daemon execution are not part of the official runtime today.
 
 `wake.py` and `aris_daemon.py` remain only for compatibility and quarantine purposes.
-
