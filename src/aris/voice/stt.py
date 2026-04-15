@@ -79,11 +79,13 @@ def ouvir_com_resultado(
     session_id=None,
     level_callback=None,
     activation_label: str = "on_demand:unknown",
+    cancel_requested=None,
 ) -> tuple[str, CaptureResult]:
     capture = capture_interaction_audio(
         session_id=session_id,
         level_callback=level_callback,
         activation_label=activation_label,
+        cancel_requested=cancel_requested,
     )
     if not capture.accepted:
         print(
@@ -100,11 +102,13 @@ def ouvir(
     level_callback=None,
     session_id=None,
     activation_label: str = "on_demand:unknown",
+    cancel_requested=None,
 ) -> str:
     texto, _ = ouvir_com_resultado(
         session_id=session_id,
         level_callback=level_callback,
         activation_label=activation_label,
+        cancel_requested=cancel_requested,
     )
     return texto
 
@@ -128,11 +132,17 @@ def aquecer():
     threading.Thread(target=_run, daemon=True).start()
 
 
-def ouvir_async(callback, level_callback=None, activation_label: str = "on_demand:unknown"):
+def ouvir_async(
+    callback,
+    level_callback=None,
+    activation_label: str = "on_demand:unknown",
+    cancel_requested=None,
+):
     def _run():
         texto = ouvir(
             level_callback=level_callback,
             activation_label=activation_label,
+            cancel_requested=cancel_requested,
         )
         if texto:
             callback(texto)

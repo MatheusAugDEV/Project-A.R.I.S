@@ -8,6 +8,7 @@ from src.aris.app.state_machine import AppEvent, AppState, InvalidTransitionErro
 from src.aris.app.ui_state import UIStateSnapshot
 from src.aris.voice.activation import (
     VoiceActivationMode,
+    VoiceActivationRejection,
     VoiceActivationRequest,
     VoiceActivationSource,
     evaluate_voice_activation_request,
@@ -28,7 +29,7 @@ from src.aris.actions.actions import (
 print("[INIT] Actions importadas!")
 
 print("[INIT] Importando stt...")
-from src.aris.voice.stt import ouvir, aquecer as aquecer_stt
+from src.aris.voice.stt import ouvir_com_resultado, aquecer as aquecer_stt
 print("[INIT] STT importado!")
 
 print("[INIT] Importando brain...")
@@ -50,8 +51,11 @@ _escuta_em_andamento = threading.Event()
 _fala_em_andamento = threading.Event()
 _recovery_pending = threading.Event()
 _runtime_operational = threading.Event()
+_voice_activation_lock = threading.RLock()
+_voice_cancel_requested = threading.Event()
 _state_machine = StateMachine()
 _interaction_sequence = count(1)
+_status_notice_sequence = count(1)
 _active_interaction_id = None
 _active_context = None
 _ui_lock = threading.RLock()
@@ -59,6 +63,10 @@ _ui_response_text = ""
 _ui_audio_level = 0.0
 _ui_error_message = None
 _ui_status_override = None
+_ui_status_notice_token = 0
+
+_F8_LISTENING_STATUS = "Escuta manual ativa. Pressione F8 novamente para cancelar."
+_F8_CANCELLING_STATUS = "Cancelando escuta manual"
 
 _INTENTS_BUSCA = {
     "pesquisa_web": "web",
@@ -120,13 +128,18 @@ def _build_ui_snapshot() -> UIStateSnapshot:
         state = _state_machine.state
         status_text = _ui_status_override or _UI_STATUS_MAP[state]
         ready_for_interaction = state == AppState.IDLE and _runtime_operational.is_set()
+        hotkey_can_cancel = (
+            state == AppState.LISTENING
+            and _escuta_em_andamento.is_set()
+            and _has_active_interaction()
+        )
         busy = not ready_for_interaction
         return UIStateSnapshot(
             state=state,
             visual_state=_GUI_STATE_MAP[state],
             status_text=status_text,
             input_enabled=ready_for_interaction,
-            voice_trigger_enabled=ready_for_interaction,
+            voice_trigger_enabled=(ready_for_interaction or hotkey_can_cancel),
             response_text=_ui_response_text,
             audio_level=_ui_audio_level,
             audio_meter_visible=(state == AppState.LISTENING),
@@ -167,6 +180,42 @@ def _set_ui_status(message: Optional[str]):
     global _ui_status_override
     with _ui_lock:
         _ui_status_override = message.strip() if isinstance(message, str) and message.strip() else None
+    _publish_ui_snapshot()
+
+
+def _set_transient_ui_status(message: str, *, duration: float = 1.8):
+    global _ui_status_override, _ui_status_notice_token
+
+    normalized = message.strip()
+    if not normalized:
+        return
+
+    with _ui_lock:
+        token = next(_status_notice_sequence)
+        _ui_status_notice_token = token
+        _ui_status_override = normalized
+    _publish_ui_snapshot()
+
+    def _clear():
+        global _ui_status_override
+
+        time.sleep(max(0.1, float(duration)))
+        with _ui_lock:
+            if _ui_status_notice_token != token or _ui_status_override != normalized:
+                return
+            _ui_status_override = None
+        _publish_ui_snapshot()
+
+    threading.Thread(target=_clear, daemon=True).start()
+
+
+def _clear_manual_voice_status():
+    global _ui_status_override
+
+    with _ui_lock:
+        if _ui_status_override not in {_F8_LISTENING_STATUS, _F8_CANCELLING_STATUS}:
+            return
+        _ui_status_override = None
     _publish_ui_snapshot()
 
 
@@ -221,6 +270,7 @@ def _finish_interaction(interaction_id: int, reason: str) -> bool:
         _active_context = None
 
     _escuta_em_andamento.clear()
+    _voice_cancel_requested.clear()
     _set_ui_audio_level(0.0)
     return True
 
@@ -238,6 +288,7 @@ def _invalidate_active_interaction(reason: str):
         _active_context = None
 
     _escuta_em_andamento.clear()
+    _voice_cancel_requested.clear()
     _set_ui_audio_level(0.0)
 
 
@@ -349,24 +400,56 @@ def _build_voice_request(source: VoiceActivationSource) -> VoiceActivationReques
     return VoiceActivationRequest(mode=VoiceActivationMode.ON_DEMAND, source=source)
 
 
+def _descrever_rejeicao_f8(decision) -> str:
+    if decision.rejection == VoiceActivationRejection.RUNTIME_NOT_READY:
+        return "F8 indisponivel enquanto o runtime termina de iniciar."
+    if decision.rejection == VoiceActivationRejection.RECOVERY_IN_PROGRESS:
+        return "F8 bloqueado durante a recuperacao do runtime."
+    if decision.rejection == VoiceActivationRejection.INTERACTION_ACTIVE:
+        return "F8 ignorado: ja existe uma interacao em andamento."
+    if decision.rejection == VoiceActivationRejection.INVALID_STATE:
+        state = _state_machine.state
+        if state == AppState.PROCESSING:
+            return "F8 indisponivel enquanto o ARIS processa o comando atual."
+        if state == AppState.SPEAKING:
+            return "F8 indisponivel enquanto o ARIS esta respondendo."
+        if state == AppState.ERROR:
+            return "F8 indisponivel enquanto o runtime estiver em erro."
+        if state == AppState.SHUTTING_DOWN:
+            return "F8 indisponivel durante o encerramento do runtime."
+        if state == AppState.BOOTING:
+            return "F8 indisponivel enquanto o runtime inicializa."
+    return "F8 indisponivel no estado atual."
+
+
+def _feedback_sem_texto_por_voz(capture_reason: str) -> str:
+    if capture_reason == "cancelled":
+        return "Escuta manual cancelada."
+    if capture_reason == "no_speech_detected":
+        return "Nenhuma fala detectada. Pressione F8 para tentar novamente."
+    return "Nao consegui entender a fala. Pressione F8 para tentar novamente."
+
+
 def _solicitar_ativacao_por_voz(request: VoiceActivationRequest) -> bool:
-    decision = evaluate_voice_activation_request(
-        request,
-        app_state=_state_machine.state,
-        runtime_ready=_runtime_operational.is_set(),
-        has_active_interaction=_has_active_interaction(),
-        recovery_pending=_recovery_pending.is_set(),
-    )
-
-    if not decision.accepted:
-        print(
-            f"[ARIS] Ativacao por voz rejeitada "
-            f"({request.activation_label}, motivo={decision.rejection.value})."
+    with _voice_activation_lock:
+        decision = evaluate_voice_activation_request(
+            request,
+            app_state=_state_machine.state,
+            runtime_ready=_runtime_operational.is_set(),
+            has_active_interaction=_has_active_interaction(),
+            recovery_pending=_recovery_pending.is_set(),
         )
-        return False
 
-    _iniciar_escuta_por_voz(request)
-    return True
+        if not decision.accepted:
+            print(
+                f"[ARIS] Ativacao por voz rejeitada "
+                f"({request.activation_label}, motivo={decision.rejection.value})."
+            )
+            if request.source == VoiceActivationSource.HOTKEY_F8:
+                _set_transient_ui_status(_descrever_rejeicao_f8(decision))
+            return False
+
+        return _iniciar_escuta_por_voz(request)
 
 
 def sinalizar_ativacao_por_wakeword() -> bool:
@@ -576,22 +659,47 @@ def processar_e_responder(texto: str):
 
 
 def solicitar_escuta_por_voz():
-    _solicitar_ativacao_por_voz(_build_voice_request(VoiceActivationSource.HOTKEY_F8))
+    with _voice_activation_lock:
+        if _state_machine.state == AppState.LISTENING:
+            if not _has_active_interaction() or not _escuta_em_andamento.is_set():
+                _set_transient_ui_status("A escuta atual ja esta sendo encerrada.")
+                print("[ARIS] F8 ignorado: escuta ja esta encerrando.")
+                return False
+            if _voice_cancel_requested.is_set():
+                _set_transient_ui_status("Cancelamento da escuta manual ja foi solicitado.")
+                print("[ARIS] F8 ignorado: cancelamento da escuta ja solicitado.")
+                return False
+            _voice_cancel_requested.set()
+            _set_ui_status(_F8_CANCELLING_STATUS)
+            _set_ui_audio_level(0.0)
+            print("[ARIS] Cancelamento da escuta manual solicitado por F8.")
+            return True
+
+        return _solicitar_ativacao_por_voz(_build_voice_request(VoiceActivationSource.HOTKEY_F8))
 
 
 def _iniciar_escuta_por_voz(request: VoiceActivationRequest):
     interaction_id = _begin_interaction(request.activation_label, phase="listening")
     if interaction_id is None:
         print("[ARIS] Nao foi possivel iniciar interacao por voz.")
-        return
+        if request.source == VoiceActivationSource.HOTKEY_F8:
+            _set_transient_ui_status("F8 ignorado: ja existe uma interacao em andamento.")
+        return False
 
     if not _transition(AppEvent.VOICE_REQUESTED, quiet=True):
         _finish_interaction(interaction_id, "pedido de voz rejeitado pela FSM")
         print(f"[ARIS] Pedido de voz ignorado no estado {_state_machine.state.value}.")
-        return
+        if request.source == VoiceActivationSource.HOTKEY_F8:
+            _set_transient_ui_status("F8 rejeitado pela FSM no estado atual.")
+        return False
 
     _escuta_em_andamento.set()
+    _voice_cancel_requested.clear()
     _set_ui_response("")
+    if request.source == VoiceActivationSource.HOTKEY_F8:
+        _set_ui_status(_F8_LISTENING_STATUS)
+    else:
+        _set_ui_status(None)
     _apply_gui_state()
 
     def _ao_receber_texto(texto: str):
@@ -601,6 +709,8 @@ def _iniciar_escuta_por_voz(request: VoiceActivationRequest):
 
         try:
             _escuta_em_andamento.clear()
+            _voice_cancel_requested.clear()
+            _clear_manual_voice_status()
             _submeter_texto_para_processamento(
                 interaction_id,
                 texto,
@@ -613,10 +723,11 @@ def _iniciar_escuta_por_voz(request: VoiceActivationRequest):
     def _run():
         try:
             _ao_nivel_audio(0.0)
-            texto = ouvir(
+            texto, capture = ouvir_com_resultado(
                 level_callback=_ao_nivel_audio,
                 session_id=interaction_id,
                 activation_label=request.activation_label,
+                cancel_requested=lambda: _voice_cancel_requested.is_set(),
             )
             if not _is_active_interaction(interaction_id):
                 print(f"[ARIS] Resultado STT descartado para interacao antiga {interaction_id}.")
@@ -625,14 +736,19 @@ def _iniciar_escuta_por_voz(request: VoiceActivationRequest):
                 _ao_receber_texto(texto)
             else:
                 _escuta_em_andamento.clear()
+                _voice_cancel_requested.clear()
+                _clear_manual_voice_status()
                 _transition(AppEvent.STT_NO_INPUT, quiet=True)
                 _set_ui_audio_level(0.0)
-                _finish_interaction(interaction_id, "stt sem entrada")
+                _finish_interaction(interaction_id, f"stt sem entrada ({capture.reason})")
+                _set_transient_ui_status(_feedback_sem_texto_por_voz(capture.reason))
         except Exception as e:
             if not _is_active_interaction(interaction_id):
                 print(f"[ARIS] Falha STT descartada da interacao antiga {interaction_id}: {e}")
                 return
             _escuta_em_andamento.clear()
+            _voice_cancel_requested.clear()
+            _clear_manual_voice_status()
             _handle_runtime_failure(
                 "stt",
                 "Falha na captura ou transcricao de voz.",
@@ -645,16 +761,14 @@ def _iniciar_escuta_por_voz(request: VoiceActivationRequest):
             _ao_nivel_audio(0.0)
 
     threading.Thread(target=_run, daemon=True).start()
+    return True
 
 
 def _criar_orb():
     novo_orb = ARISOrb()
 
-    def ouvir_e_processar():
-        _solicitar_ativacao_por_voz(_build_voice_request(VoiceActivationSource.GUI_BUTTON))
-
     novo_orb.on_input = processar_e_responder
-    novo_orb.on_voice = ouvir_e_processar
+    novo_orb.on_voice = solicitar_escuta_por_voz
     return novo_orb
 
 

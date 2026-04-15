@@ -327,6 +327,7 @@ def capture_interaction_audio(
     level_callback=None,
     config: Optional[CaptureConfig] = None,
     activation_label: str = "on_demand:unknown",
+    cancel_requested=None,
 ) -> CaptureResult:
     config = config or CaptureConfig()
     threshold = calibrate_input_threshold(
@@ -359,6 +360,7 @@ def capture_interaction_audio(
     pending_start_chunks = 0
     rms_values = []
     peak_values = []
+    cancelled = False
 
     with sd.InputStream(
         samplerate=config.sample_rate,
@@ -368,6 +370,10 @@ def capture_interaction_audio(
         blocksize=config.chunk_size,
     ) as stream:
         while total_frames < max_frames:
+            if cancel_requested is not None and cancel_requested():
+                cancelled = True
+                break
+
             chunk, _ = stream.read(config.chunk_size)
             chunk = chunk.copy().flatten().astype(np.float32)
             total_frames += len(chunk)
@@ -377,6 +383,10 @@ def capture_interaction_audio(
             rms_values.append(rms)
             peak_values.append(peak)
             emit_level(level_callback, rms / max(threshold * 3.0, 1e-6))
+
+            if cancel_requested is not None and cancel_requested():
+                cancelled = True
+                break
 
             chunk_has_speech = _chunk_has_speech(
                 chunk,
@@ -416,6 +426,23 @@ def capture_interaction_audio(
                     break
 
     emit_level(level_callback, 0.0)
+
+    if cancelled:
+        duration_secs = total_frames / max(config.sample_rate, 1)
+        return CaptureResult(
+            session_id=session_id,
+            accepted=False,
+            reason="cancelled",
+            audio=np.array([], dtype=np.float32),
+            sample_rate=config.sample_rate,
+            threshold=threshold,
+            rms_mean=float(np.mean(rms_values)) if rms_values else 0.0,
+            rms_peak=max(peak_values) if peak_values else 0.0,
+            speech_ratio=0.0,
+            active_secs=active_frames / max(config.sample_rate, 1),
+            duration_secs=duration_secs,
+            speech_started=speech_started,
+        )
 
     if not captured_chunks:
         duration_secs = total_frames / max(config.sample_rate, 1)

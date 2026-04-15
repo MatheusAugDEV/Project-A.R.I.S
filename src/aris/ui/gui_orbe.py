@@ -29,7 +29,7 @@ STATES = {
 STATE_META = {
     AppState.BOOTING: {"label": "BOOTING", "accent": (255, 184, 82), "hint": "Inicializando modulos e preparando a sessao"},
     AppState.IDLE: {"label": "PRONTO", "accent": (90, 232, 235), "hint": "Texto e F8 disponiveis quando o runtime estiver pronto"},
-    AppState.LISTENING: {"label": "ESCUTA ATIVA", "accent": (74, 240, 255), "hint": "Fale agora perto do notebook"},
+    AppState.LISTENING: {"label": "ESCUTA ATIVA", "accent": (74, 240, 255), "hint": "Fale agora. Pressione F8 novamente para cancelar"},
     AppState.PROCESSING: {"label": "ANALISANDO", "accent": (80, 174, 255), "hint": "Interpretando comando e preparando resposta"},
     AppState.SPEAKING: {"label": "RESPONDENDO", "accent": (74, 225, 196), "hint": "ARIS esta falando"},
     AppState.ERROR: {"label": "ERRO", "accent": (255, 104, 104), "hint": "Falha recuperavel no runtime atual"},
@@ -478,15 +478,25 @@ class ARISOrb:
         subtitle.set_alpha(155)
         screen.blit(subtitle, (layout.width // 2 - subtitle.get_width() // 2, state_y + 35))
 
+        if current_app_state == AppState.LISTENING and current_voice_trigger_enabled:
+            f8_label = "F8 cancela"
+            f8_filled = True
+        elif current_voice_trigger_enabled:
+            f8_label = "F8 inicia voz"
+            f8_filled = True
+        else:
+            f8_label = "F8 indisponivel"
+            f8_filled = False
+
         self._draw_action_chip(
             screen,
             fonts.micro,
             layout.width // 2 - 76,
             layout.chip_y,
-            "F8 pronto" if current_voice_trigger_enabled else "F8 indisponivel",
+            f8_label,
             current_voice_trigger_enabled,
             (112, 226, 255),
-            filled=current_voice_trigger_enabled,
+            filled=f8_filled,
         )
         self._draw_action_chip(
             screen,
@@ -847,7 +857,7 @@ class ARISOrb:
                             fullscreen = True
                             screen = self._set_display_mode(windowed_size, fullscreen=True)
                     elif event.key == pygame.K_F8:
-                        if self.on_voice and self.voice_trigger_enabled:
+                        if self.on_voice:
                             threading.Thread(target=self.on_voice, daemon=True).start()
                     elif event.key == pygame.K_RETURN:
                         self._send()
