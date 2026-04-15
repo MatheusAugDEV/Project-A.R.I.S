@@ -427,7 +427,15 @@ def _feedback_sem_texto_por_voz(capture_reason: str) -> str:
         return "Escuta manual cancelada."
     if capture_reason == "no_speech_detected":
         return "Nenhuma fala detectada. Pressione F8 para tentar novamente."
-    return "Nao consegui entender a fala. Pressione F8 para tentar novamente."
+    if capture_reason == "speech_not_confirmed":
+        return "Fala interrompida antes da captura estabilizar. Pressione F8 e fale novamente."
+    if capture_reason in {"speech_too_short", "too_few_voiced_chunks"}:
+        return "Fala curta demais para processar. Pressione F8 e tente novamente."
+    if capture_reason in {"trimmed_to_empty", "low_speech_ratio"}:
+        return "A captura ficou instavel ou com muito ruido. Pressione F8 e tente novamente."
+    if capture_reason == "ok":
+        return "Captei o audio, mas nao consegui extrair uma fala util. Pressione F8 e tente novamente."
+    return f"Captura encerrada sem texto util ({capture_reason}). Pressione F8 e tente novamente."
 
 
 def _solicitar_ativacao_por_voz(request: VoiceActivationRequest) -> bool:

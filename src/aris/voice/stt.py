@@ -95,7 +95,14 @@ def ouvir_com_resultado(
         )
         return "", capture
 
-    return transcrever(capture.audio), capture
+    texto = transcrever(capture.audio)
+    if not texto:
+        print(
+            f"[STT] Sessao {session_id} sem texto util "
+            f"(activation={activation_label}, capture_reason={capture.reason}, "
+            f"active_secs={capture.active_secs:.2f})"
+        )
+    return texto, capture
 
 
 def ouvir(

@@ -321,6 +321,53 @@ def _trim_edge_silence(audio: np.ndarray, threshold: float, sample_rate: int) ->
     return audio[start:end] if end > start else np.array([], dtype=np.float32)
 
 
+def _append_chunk_if_new(chunks: list[np.ndarray], chunk: np.ndarray) -> None:
+    if chunks and np.array_equal(chunks[-1], chunk):
+        return
+    chunks.append(chunk)
+
+
+def _extend_chunks_if_new(target: list[np.ndarray], source: list[np.ndarray]) -> None:
+    for chunk in source:
+        _append_chunk_if_new(target, chunk)
+
+
+def _build_empty_capture_result(
+    *,
+    session_id: Optional[int],
+    reason: str,
+    sample_rate: int,
+    threshold: float,
+    rms_values: list[float],
+    peak_values: list[float],
+    active_frames: int,
+    duration_secs: float,
+    speech_started: bool,
+) -> CaptureResult:
+    return CaptureResult(
+        session_id=session_id,
+        accepted=False,
+        reason=reason,
+        audio=np.array([], dtype=np.float32),
+        sample_rate=sample_rate,
+        threshold=threshold,
+        rms_mean=float(np.mean(rms_values)) if rms_values else 0.0,
+        rms_peak=max(peak_values) if peak_values else 0.0,
+        speech_ratio=0.0,
+        active_secs=active_frames / max(sample_rate, 1),
+        duration_secs=duration_secs,
+        speech_started=speech_started,
+    )
+
+
+def _log_capture_end(result: CaptureResult, activation_label: str) -> None:
+    print(
+        f"[Audio] Sessao {result.session_id} encerrada "
+        f"(activation={activation_label}, accepted={result.accepted}, reason={result.reason}, "
+        f"active_secs={result.active_secs:.2f}, ratio={result.speech_ratio:.2f})"
+    )
+
+
 def capture_interaction_audio(
     *,
     session_id: Optional[int] = None,
@@ -348,7 +395,9 @@ def capture_interaction_audio(
         f"preroll={config.preroll_ms}ms, hold={config.silence_hold_ms}ms)"
     )
 
-    preroll = deque(maxlen=preroll_chunks)
+    # Cada sessao separa audio em tres zonas: historico recente, candidata ao inicio de fala
+    # e audio ja confirmado. Isso evita que uma falsa largada contamine a sessao final.
+    history_chunks = deque(maxlen=preroll_chunks)
     captured_chunks = []
     total_frames = 0
     active_frames = 0
@@ -358,6 +407,10 @@ def capture_interaction_audio(
     speech_start_run = 0
     pending_start_frames = 0
     pending_start_chunks = 0
+    voice_activity_frames = 0
+    voice_activity_detected = False
+    candidate_preroll: list[np.ndarray] = []
+    candidate_chunks: list[np.ndarray] = []
     rms_values = []
     peak_values = []
     cancelled = False
@@ -396,26 +449,40 @@ def capture_interaction_audio(
             )
 
             if not speech_started:
-                preroll.append(chunk)
                 if chunk_has_speech:
+                    voice_activity_detected = True
+                    voice_activity_frames += len(chunk)
+                    if speech_start_run == 0:
+                        candidate_preroll = list(history_chunks)
+                        candidate_chunks = []
+                        pending_start_frames = 0
+                        pending_start_chunks = 0
                     speech_start_run += 1
                     pending_start_frames += len(chunk)
                     pending_start_chunks += 1
+                    _append_chunk_if_new(candidate_chunks, chunk)
                     if speech_start_run >= max(1, config.start_trigger_chunks):
                         speech_started = True
-                        captured_chunks.extend(preroll)
+                        _extend_chunks_if_new(captured_chunks, candidate_preroll)
+                        _extend_chunks_if_new(captured_chunks, candidate_chunks)
                         active_frames += pending_start_frames
                         voiced_chunks += pending_start_chunks
                         silence_frames = 0
+                        history_chunks.clear()
+                        candidate_preroll = []
+                        candidate_chunks = []
                 else:
+                    history_chunks.append(chunk)
                     speech_start_run = 0
                     pending_start_frames = 0
                     pending_start_chunks = 0
+                    candidate_preroll = []
+                    candidate_chunks = []
                 if total_frames >= start_timeout_frames:
                     break
                 continue
 
-            captured_chunks.append(chunk)
+            _append_chunk_if_new(captured_chunks, chunk)
             if chunk_has_speech:
                 active_frames += len(chunk)
                 voiced_chunks += 1
@@ -429,37 +496,35 @@ def capture_interaction_audio(
 
     if cancelled:
         duration_secs = total_frames / max(config.sample_rate, 1)
-        return CaptureResult(
+        result = _build_empty_capture_result(
             session_id=session_id,
-            accepted=False,
             reason="cancelled",
-            audio=np.array([], dtype=np.float32),
             sample_rate=config.sample_rate,
             threshold=threshold,
-            rms_mean=float(np.mean(rms_values)) if rms_values else 0.0,
-            rms_peak=max(peak_values) if peak_values else 0.0,
-            speech_ratio=0.0,
-            active_secs=active_frames / max(config.sample_rate, 1),
+            rms_values=rms_values,
+            peak_values=peak_values,
+            active_frames=max(active_frames, voice_activity_frames),
             duration_secs=duration_secs,
             speech_started=speech_started,
         )
+        _log_capture_end(result, activation_label)
+        return result
 
     if not captured_chunks:
         duration_secs = total_frames / max(config.sample_rate, 1)
-        return CaptureResult(
+        result = _build_empty_capture_result(
             session_id=session_id,
-            accepted=False,
-            reason="no_speech_detected",
-            audio=np.array([], dtype=np.float32),
+            reason="speech_not_confirmed" if voice_activity_detected else "no_speech_detected",
             sample_rate=config.sample_rate,
             threshold=threshold,
-            rms_mean=float(np.mean(rms_values)) if rms_values else 0.0,
-            rms_peak=max(peak_values) if peak_values else 0.0,
-            speech_ratio=0.0,
-            active_secs=0.0,
+            rms_values=rms_values,
+            peak_values=peak_values,
+            active_frames=voice_activity_frames,
             duration_secs=duration_secs,
             speech_started=False,
         )
+        _log_capture_end(result, activation_label)
+        return result
 
     audio = np.concatenate(captured_chunks, axis=0).astype(np.float32)
     audio = _trim_edge_silence(audio, threshold, config.sample_rate)
@@ -487,13 +552,7 @@ def capture_interaction_audio(
         reason = "ok"
         accepted = True
 
-    print(
-        f"[Audio] Sessao {session_id} encerrada "
-        f"(activation={activation_label}, accepted={accepted}, reason={reason}, "
-        f"active_secs={active_secs:.2f}, ratio={ratio:.2f})"
-    )
-
-    return CaptureResult(
+    result = CaptureResult(
         session_id=session_id,
         accepted=accepted,
         reason=reason,
@@ -507,3 +566,5 @@ def capture_interaction_audio(
         duration_secs=duration_secs,
         speech_started=speech_started,
     )
+    _log_capture_end(result, activation_label)
+    return result
