@@ -17,6 +17,7 @@ class AppState(str, Enum):
 class AppEvent(str, Enum):
     BOOT_COMPLETED = "BOOT_COMPLETED"
     BOOT_FAILED = "BOOT_FAILED"
+    RECOVER_REQUESTED = "RECOVER_REQUESTED"
     VOICE_REQUESTED = "VOICE_REQUESTED"
     MANUAL_TEXT_RECEIVED = "MANUAL_TEXT_RECEIVED"
     STT_TEXT_READY = "STT_TEXT_READY"
@@ -25,6 +26,7 @@ class AppEvent(str, Enum):
     PROCESSING_COMPLETED = "PROCESSING_COMPLETED"
     PROCESSING_FAILED = "PROCESSING_FAILED"
     TTS_COMPLETED = "TTS_COMPLETED"
+    TTS_FAILED = "TTS_FAILED"
     SHUTDOWN_REQUESTED = "SHUTDOWN_REQUESTED"
 
 
@@ -59,9 +61,11 @@ _TRANSITIONS: dict[AppState, dict[AppEvent, AppState]] = {
     },
     AppState.SPEAKING: {
         AppEvent.TTS_COMPLETED: AppState.IDLE,
+        AppEvent.TTS_FAILED: AppState.ERROR,
         AppEvent.SHUTDOWN_REQUESTED: AppState.SHUTTING_DOWN,
     },
     AppState.ERROR: {
+        AppEvent.RECOVER_REQUESTED: AppState.BOOTING,
         AppEvent.SHUTDOWN_REQUESTED: AppState.SHUTTING_DOWN,
     },
     AppState.SHUTTING_DOWN: {},
@@ -88,4 +92,3 @@ class StateMachine:
                 raise InvalidTransitionError(self._state, event)
             self._state = _TRANSITIONS[self._state][event]
             return self._state
-

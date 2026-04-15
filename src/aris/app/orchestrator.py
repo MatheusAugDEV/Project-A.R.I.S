@@ -1,4 +1,5 @@
 import threading
+import time
 from dataclasses import dataclass
 from itertools import count
 from typing import Optional
@@ -41,6 +42,8 @@ _gui_ativa = threading.Event()
 _abrindo_gui = threading.Event()
 _escuta_em_andamento = threading.Event()
 _fala_em_andamento = threading.Event()
+_recovery_pending = threading.Event()
+_runtime_operational = threading.Event()
 _state_machine = StateMachine()
 _interaction_sequence = count(1)
 _active_interaction_id = None
@@ -49,11 +52,19 @@ _ui_lock = threading.RLock()
 _ui_response_text = ""
 _ui_audio_level = 0.0
 _ui_error_message = None
+_ui_status_override = None
 
 _INTENTS_BUSCA = {
     "pesquisa_web": "web",
     "pesquisa_video": "video",
     "pesquisa_noticias": "noticias",
+}
+
+_OPERATIONAL_STATES = {
+    AppState.IDLE,
+    AppState.LISTENING,
+    AppState.PROCESSING,
+    AppState.SPEAKING,
 }
 
 _GUI_STATE_MAP = {
@@ -67,12 +78,12 @@ _GUI_STATE_MAP = {
 }
 
 _UI_STATUS_MAP = {
-    AppState.BOOTING: "Inicializando",
-    AppState.IDLE: "Aguardando comando",
+    AppState.BOOTING: "Inicializando runtime",
+    AppState.IDLE: "Pronto para interagir",
     AppState.LISTENING: "Escutando",
     AppState.PROCESSING: "Processando",
     AppState.SPEAKING: "Respondendo",
-    AppState.ERROR: "Erro",
+    AppState.ERROR: "Erro recuperavel",
     AppState.SHUTTING_DOWN: "Encerrando",
 }
 
@@ -101,13 +112,15 @@ def _set_orb(novo_orb):
 def _build_ui_snapshot() -> UIStateSnapshot:
     with _ui_lock:
         state = _state_machine.state
-        busy = state != AppState.IDLE
+        status_text = _ui_status_override or _UI_STATUS_MAP[state]
+        ready_for_interaction = state == AppState.IDLE and _runtime_operational.is_set()
+        busy = not ready_for_interaction
         return UIStateSnapshot(
             state=state,
             visual_state=_GUI_STATE_MAP[state],
-            status_text=_UI_STATUS_MAP[state],
-            input_enabled=(state == AppState.IDLE),
-            voice_trigger_enabled=(state == AppState.IDLE),
+            status_text=status_text,
+            input_enabled=ready_for_interaction,
+            voice_trigger_enabled=ready_for_interaction,
             response_text=_ui_response_text,
             audio_level=_ui_audio_level,
             audio_meter_visible=(state == AppState.LISTENING),
@@ -141,6 +154,13 @@ def _set_ui_error(message: Optional[str]):
     global _ui_error_message
     with _ui_lock:
         _ui_error_message = message
+    _publish_ui_snapshot()
+
+
+def _set_ui_status(message: Optional[str]):
+    global _ui_status_override
+    with _ui_lock:
+        _ui_status_override = message.strip() if isinstance(message, str) and message.strip() else None
     _publish_ui_snapshot()
 
 
@@ -216,15 +236,23 @@ def _invalidate_active_interaction(reason: str):
 
 
 def _apply_gui_state():
-    if _state_machine.state != AppState.ERROR:
+    if _state_machine.state in _OPERATIONAL_STATES or _state_machine.state == AppState.SHUTTING_DOWN:
         _set_ui_error(None)
     _publish_ui_snapshot()
+
+
+def _sync_runtime_operational(state: AppState):
+    if state in _OPERATIONAL_STATES:
+        _runtime_operational.set()
+    else:
+        _runtime_operational.clear()
 
 
 def _transition(event: AppEvent, *, quiet: bool = False) -> bool:
     try:
         novo_estado = _state_machine.transition(event)
         print(f"[ARIS] Estado -> {novo_estado.value} ({event.value})")
+        _sync_runtime_operational(novo_estado)
         _apply_gui_state()
         return True
     except InvalidTransitionError as exc:
@@ -238,16 +266,97 @@ def _ao_nivel_audio(level: float):
         _set_ui_audio_level(level)
 
 
-def _falar_async(texto: str, ao_final=None):
+def _complete_boot_to_idle() -> bool:
+    if _state_machine.state != AppState.BOOTING:
+        return False
+    if not _transition(AppEvent.BOOT_COMPLETED, quiet=True):
+        return False
+    _set_ui_status(None)
+    _apply_gui_state()
+    return True
+
+
+def _schedule_runtime_recovery(stage: str, *, rewarm_stt: bool = False):
+    if _state_machine.state != AppState.ERROR:
+        return
+    if _recovery_pending.is_set():
+        return
+    if not _gui_ativa.is_set():
+        return
+
+    _recovery_pending.set()
+    _set_ui_status("Erro recuperavel. Tentando restabelecer o runtime")
+
+    def _run():
+        try:
+            time.sleep(0.35)
+            if _state_machine.state != AppState.ERROR:
+                return
+
+            _set_ui_status("Recuperando runtime")
+            if not _transition(AppEvent.RECOVER_REQUESTED, quiet=True):
+                return
+
+            if rewarm_stt:
+                _set_ui_status("Recuperando reconhecimento de voz")
+                aquecer_stt()
+
+            _set_ui_status("Retomando estado operacional")
+            if not _complete_boot_to_idle():
+                raise RuntimeError("Nao foi possivel concluir a recuperacao da FSM.")
+
+            print(f"[ARIS] Runtime recuperado apos falha em {stage}.")
+        except Exception as exc:
+            print(f"[ARIS] Falha na recuperacao ({stage}): {type(exc).__name__}: {exc}")
+            _set_ui_error(f"Falha na recuperacao: {type(exc).__name__}")
+            _set_ui_status("Erro de recuperacao")
+            if _state_machine.state == AppState.BOOTING:
+                _transition(AppEvent.BOOT_FAILED, quiet=True)
+        finally:
+            _recovery_pending.clear()
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def _handle_runtime_failure(
+    stage: str,
+    message: str,
+    event: AppEvent,
+    interaction_id: int,
+    *,
+    exc: Exception | None = None,
+    rewarm_stt: bool = False,
+):
+    if exc is not None:
+        print(f"[ARIS] Falha em {stage}: {type(exc).__name__}: {exc}")
+
+    _set_ui_error(message)
+    _set_ui_status("Erro recuperavel")
+    transitioned = _transition(event, quiet=True)
+    _finish_interaction(interaction_id, f"falha em {stage}")
+
+    if transitioned and _state_machine.state == AppState.ERROR:
+        _schedule_runtime_recovery(stage, rewarm_stt=rewarm_stt)
+
+
+def _falar_async(texto: str, ao_final=None, ao_erro=None):
     def _run():
         _fala_em_andamento.set()
+        erro = None
         try:
             falar(texto)
+        except Exception as exc:
+            erro = exc
+            print(f"[ARIS] Falha TTS: {type(exc).__name__}: {exc}")
         finally:
             _fala_em_andamento.clear()
-            if ao_final:
+            callback = ao_erro if erro is not None else ao_final
+            if callback:
                 try:
-                    ao_final()
+                    if erro is not None:
+                        callback(erro)
+                    else:
+                        callback()
                 except Exception as e:
                     print(f"[ARIS] Erro no callback de audio: {e}")
 
@@ -283,6 +392,27 @@ def _concluir_fala_e_encerrar(interaction_id: int):
     _fechar_janela()
 
 
+def _tratar_falha_tts(interaction_id: int, exc: Exception, *, close_after_failure: bool = False):
+    if not _is_active_interaction(interaction_id):
+        print(f"[ARIS] Falha TTS ignorada para interacao antiga {interaction_id}.")
+        return
+
+    if close_after_failure:
+        _set_ui_error("Falha ao reproduzir o audio de encerramento.")
+        _finish_interaction(interaction_id, "falha de tts com encerramento")
+        _fechar_janela()
+        return
+
+    _handle_runtime_failure(
+        "tts",
+        "Falha na sintese ou reproducao de voz.",
+        AppEvent.TTS_FAILED,
+        interaction_id,
+        exc=exc,
+        rewarm_stt=False,
+    )
+
+
 def _executar_processamento(interaction_id: int, texto: str):
     if not _is_active_interaction(interaction_id):
         print(f"[ARIS] Processamento descartado para interacao antiga {interaction_id}.")
@@ -307,12 +437,17 @@ def _executar_processamento(interaction_id: int, texto: str):
         else:
             intencao = None
             resposta = perguntar_ia(texto, memoria)
-    except Exception:
+    except Exception as exc:
         if _is_active_interaction(interaction_id):
-            _set_ui_error("Falha no processamento do comando.")
-            _transition(AppEvent.PROCESSING_FAILED, quiet=True)
-            _finish_interaction(interaction_id, "falha de processamento")
-        raise
+            _handle_runtime_failure(
+                "processing",
+                "Falha no processamento do comando.",
+                AppEvent.PROCESSING_FAILED,
+                interaction_id,
+                exc=exc,
+                rewarm_stt=False,
+            )
+        return
 
     if not _is_active_interaction(interaction_id):
         print(f"[ARIS] Resultado descartado para interacao antiga {interaction_id}.")
@@ -333,10 +468,18 @@ def _executar_processamento(interaction_id: int, texto: str):
     print(f"[ARIS]: {resposta}")
 
     if intencao == "sair":
-        _falar_async(resposta, ao_final=lambda: _concluir_fala_e_encerrar(interaction_id))
+        _falar_async(
+            resposta,
+            ao_final=lambda: _concluir_fala_e_encerrar(interaction_id),
+            ao_erro=lambda exc: _tratar_falha_tts(interaction_id, exc, close_after_failure=True),
+        )
         return
 
-    _falar_async(resposta, ao_final=lambda: _concluir_fala(interaction_id))
+    _falar_async(
+        resposta,
+        ao_final=lambda: _concluir_fala(interaction_id),
+        ao_erro=lambda exc: _tratar_falha_tts(interaction_id, exc),
+    )
 
 
 def _submeter_texto_para_processamento(
@@ -445,10 +588,14 @@ def _iniciar_escuta_por_voz():
                 print(f"[ARIS] Falha STT descartada da interacao antiga {interaction_id}: {e}")
                 return
             _escuta_em_andamento.clear()
-            _set_ui_error("Falha na captura ou transcricao de voz.")
-            _transition(AppEvent.STT_FAILED, quiet=True)
-            _finish_interaction(interaction_id, "falha de stt")
-            raise
+            _handle_runtime_failure(
+                "stt",
+                "Falha na captura ou transcricao de voz.",
+                AppEvent.STT_FAILED,
+                interaction_id,
+                exc=e,
+                rewarm_stt=True,
+            )
         finally:
             _ao_nivel_audio(0.0)
 
@@ -474,7 +621,10 @@ def _executar_janela():
         _gui_ativa.set()
         _set_ui_response("")
         _set_ui_audio_level(0.0)
+        _set_ui_status("Preparando interface")
         _publish_ui_snapshot()
+        if _state_machine.state == AppState.BOOTING and not _complete_boot_to_idle():
+            raise RuntimeError("Nao foi possivel finalizar o boot do runtime.")
 
         atual.run_blocking()
     finally:
@@ -490,23 +640,30 @@ def run_manual_runtime():
     global memoria
 
     try:
+        _runtime_operational.clear()
+        _recovery_pending.clear()
+        _set_ui_error(None)
+        _set_ui_status("Carregando memoria")
         print("[ARIS] Carregando memoria...")
         memoria = carregar_memoria()
         print("[ARIS] Memoria carregada!")
+        _set_ui_status("Aquecendo reconhecimento de voz")
         print("[ARIS] Aquecendo reconhecimento de voz...")
         aquecer_stt()
-        _transition(AppEvent.BOOT_COMPLETED, quiet=True)
+        _set_ui_status("Abrindo interface")
         print("[ARIS] Modo manual ativo. Sem escuta em segundo plano.")
         print("[ARIS] Abrindo interface...")
         _executar_janela()
 
     except KeyboardInterrupt:
         _invalidate_active_interaction("interrupcao por teclado")
+        _set_ui_status("Encerrando")
         _transition(AppEvent.SHUTDOWN_REQUESTED, quiet=True)
         print("[ARIS] Encerrando por teclado...")
     except Exception as e:
         if _state_machine.state == AppState.BOOTING:
             _set_ui_error(f"Falha no boot: {type(e).__name__}")
+            _set_ui_status("Falha no boot")
             _transition(AppEvent.BOOT_FAILED, quiet=True)
         print(f"[ERRO] {type(e).__name__}: {e}")
         import traceback
