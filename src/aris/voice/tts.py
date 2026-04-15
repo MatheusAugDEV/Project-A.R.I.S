@@ -1,0 +1,200 @@
+from google import genai
+from google.genai import types
+import os
+import re
+import subprocess
+import tempfile
+import time
+import threading
+
+import soundfile as sf
+from dotenv import load_dotenv
+
+from src.aris.config.settings import settings
+
+MODEL_PATH = str(settings.piper_model_path)
+PIPER_BIN = settings.piper_bin
+ENV_PATH = settings.env_path
+_SPEAK_LOCK = threading.Lock()
+DEFAULT_STYLE = (
+    "Fale em portugues do Brasil com voz masculina, grave, controlada e sofisticada. "
+    "Use ritmo moderado, diccao muito clara, tom tecnologico elegante e confiante. "
+    "Soe como um assistente premium, calmo, preciso e levemente sintetico, sem exagero emocional. "
+    "Evite teatralidade, humor forcado, gritos ou entusiasmo excessivo. "
+    "Mantenha pausas curtas e autoridade serena."
+)
+
+
+def _load_config() -> dict:
+    load_dotenv(ENV_PATH, override=True)
+    return {
+        "api_key": os.getenv("GEMINI_API_KEY", ""),
+        "backend": os.getenv("ARIS_TTS_BACKEND", settings.tts_backend).strip().lower(),
+        "model": os.getenv("ARIS_GOOGLE_TTS_MODEL", settings.tts_google_model),
+        "voice": os.getenv("ARIS_GOOGLE_TTS_VOICE", settings.tts_google_voice),
+        "style": os.getenv("ARIS_GOOGLE_TTS_STYLE", DEFAULT_STYLE),
+        "timeout": float(os.getenv("ARIS_GOOGLE_TTS_TIMEOUT", str(settings.tts_google_timeout))),
+        "retries": max(1, int(os.getenv("ARIS_GOOGLE_TTS_RETRIES", str(settings.tts_google_retries)))),
+    }
+
+
+def _preparar_texto(texto: str) -> str:
+    return re.sub(r"\bARIS\b", "Áris", texto)
+
+
+def _tocar_arquivo(path: str):
+    try:
+        subprocess.run(["aplay", "-q", path], check=True)
+    except Exception as e:
+        print(f"[TTS _tocar erro] {e}")
+        raise
+
+
+def _cortar_frase(texto: str, limite: int) -> str:
+    if len(texto) <= limite:
+        return texto
+    for sep in (".", "!", "?", ";", ":"):
+        idx = texto.rfind(sep, 0, limite)
+        if idx > limite // 3:
+            return texto[: idx + 1]
+    return texto[:limite] + "."
+
+
+def _quebrar_texto(texto: str, limite: int = 600) -> list[str]:
+    partes = []
+    restante = texto.strip()
+    while restante:
+        bloco = _cortar_frase(restante, limite)
+        partes.append(bloco)
+        restante = restante[len(bloco) :].strip()
+    return partes
+
+
+def _piper(texto: str) -> bool:
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            tmp = f.name
+        print("[TTS] piper gerando audio...")
+        result = subprocess.run(
+            [PIPER_BIN, "--model", MODEL_PATH, "--output-file", tmp, "--length-scale", "1.08"],
+            input=texto.encode("utf-8"),
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            print(f"[TTS] piper stderr: {result.stderr.decode(errors='ignore')[:240]}")
+            return False
+        print("[TTS] tocando via aplay...")
+        _tocar_arquivo(tmp)
+        print("[TTS] audio concluido")
+        return True
+    except Exception as e:
+        print(f"[TTS Piper falhou] {e}")
+        return False
+    finally:
+        if tmp and os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def _gemini_prompt(texto: str, config: dict) -> str:
+    return (
+        f"{config['style']}\n\n"
+        "Regras adicionais:\n"
+        "- nao improvise palavras extras\n"
+        "- preserve nomes tecnicos\n"
+        "- mantenha naturalidade profissional\n"
+        "- fale exatamente o texto abaixo\n\n"
+        f"Texto:\n{texto}"
+    )
+
+
+def _gemini(texto: str, config: dict) -> bool:
+    if not config["api_key"]:
+        print("[TTS Gemini] GEMINI_API_KEY ausente.")
+        return False
+
+    last_error = None
+    for tentativa in range(1, config["retries"] + 1):
+        tmp = None
+        try:
+            client = genai.Client(
+                api_key=config["api_key"],
+                http_options={"timeout": config["timeout"]},
+            )
+            response = client.models.generate_content(
+                model=config["model"],
+                contents=_gemini_prompt(texto, config),
+                config=types.GenerateContentConfig(
+                    response_modalities=["AUDIO"],
+                    temperature=0.3,
+                    speech_config=types.SpeechConfig(
+                        voice_config=types.VoiceConfig(
+                            prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                                voice_name=config["voice"]
+                            )
+                        )
+                    ),
+                ),
+            )
+
+            audio_data = response.candidates[0].content.parts[0].inline_data.data
+            import numpy as np
+
+            samples = np.frombuffer(audio_data, dtype=np.int16)
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+                tmp = f.name
+            sf.write(tmp, samples, 24000, subtype="PCM_16")
+            print(
+                f"[TTS Gemini] backend=google voz={config['voice']} "
+                f"modelo={config['model']} tentativa={tentativa}"
+            )
+            _tocar_arquivo(tmp)
+            return True
+        except Exception as e:
+            last_error = e
+            print(f"[TTS Gemini falhou] tentativa={tentativa} erro={e}")
+            time.sleep(0.6 * tentativa)
+        finally:
+            if tmp and os.path.exists(tmp):
+                os.unlink(tmp)
+
+    if last_error:
+        print(f"[TTS Gemini] esgotado apos {config['retries']} tentativa(s).")
+    return False
+
+
+def _falar_parte(parte: str, config: dict):
+    print(f"[TTS] backend_preferido={config['backend']} voz_google={config['voice']}")
+
+    if config["backend"] == "piper":
+        if not _piper(parte):
+            print("[TTS] Piper falhou, tentando Google.")
+            _gemini(parte, config)
+        return
+
+    if config["backend"] == "google":
+        if not _gemini(parte, config):
+            print("[TTS] Google falhou, tentando Piper.")
+            _piper(parte)
+        return
+
+    if config["backend"] == "hybrid":
+        if not _gemini(parte, config):
+            print("[TTS] Google falhou, tentando Piper.")
+            _piper(parte)
+        return
+
+    print(f"[TTS] Backend desconhecido '{config['backend']}', usando Google.")
+    if not _gemini(parte, config):
+        _piper(parte)
+
+
+def falar(texto: str):
+    if not texto.strip():
+        return
+
+    with _SPEAK_LOCK:
+        texto = _preparar_texto(texto)
+        config = _load_config()
+        for parte in _quebrar_texto(texto):
+            _falar_parte(parte, config)
